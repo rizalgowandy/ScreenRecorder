@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using ScreenRecorder.Command;
@@ -51,11 +53,11 @@ namespace ScreenRecorder
                 {
                     if (propertyInfo.GetValue(this, null) is DelegateCommand command)
                     {
-                        command.WhenChanged(() =>
+                        command.PropertyChanged += (s, e) =>
                         {
-                            _configFileSaveWorker?.SetModifiedConfigData();
-                        },
-                        nameof(DelegateCommand.KeyGesture));
+                            if (e.PropertyName == nameof(DelegateCommand.KeyGesture))
+                                _configFileSaveWorker?.SetModifiedConfigData();
+                        };
                     }
                 }
             }
@@ -194,14 +196,21 @@ namespace ScreenRecorder
         private DelegateCommand _selectRecordDirectory;
         private DelegateCommand _openShortcutSettingsCommand;
         private DelegateCommand _windowCloseCommand;
+        private DelegateCommand _windowMinimizeCommand;
+
+        // Non-null while the pre-record countdown (#56) is running; cancelled by the stop command.
+        private CancellationTokenSource _recordDelayCts;
 
         #endregion
 
         #region Record Commands
 
         public DelegateCommand StartScreenRecordCommand => _startScreenRecordCommand ??
-            (_startScreenRecordCommand = new DelegateCommand(o =>
+            (_startScreenRecordCommand = new DelegateCommand(async o =>
             {
+                if (_recordDelayCts != null)
+                    return; // a pre-record countdown is already running
+
                 if (AppManager.Instance.ScreenEncoder.Status == Encoder.EncoderStatus.Stop)
                 {
                     var encodeFormat = AppManager.Instance.EncoderFormats.FirstOrDefault((x => x.Format.Equals(AppConfig.Instance.SelectedRecordFormat, StringComparison.OrdinalIgnoreCase)));
@@ -249,18 +258,15 @@ namespace ScreenRecorder
                                     break;
                                 case CaptureTarget.ByUserChoiceTargetDeviceName:
                                     #region Select Region
-                                    var regionSelectorWindow = new Region.RegionSelectorWindow()
-                                    {
-                                        RegionSelectionMode = AppConfig.Instance.RegionSelectionMode
-                                    };
+                                    var regionSelectorSession = new Region.RegionSelectorSession();
                                     try
                                     {
-                                        if (!regionSelectorWindow.ShowDialog().Value)
+                                        if (!regionSelectorSession.ShowDialog(AppConfig.Instance.RegionSelectionMode))
                                         {
                                             return;
                                         }
 
-                                        var result = regionSelectorWindow.RegionSelectionResult;
+                                        var result = regionSelectorSession.RegionSelectionResult;
                                         if (result != null)
                                         {
                                             displayDeviceName = result.DeviceName;
@@ -279,11 +285,48 @@ namespace ScreenRecorder
                                     }
                                     finally
                                     {
-                                        AppConfig.Instance.RegionSelectionMode = regionSelectorWindow.RegionSelectionMode;
+                                        AppConfig.Instance.RegionSelectionMode = regionSelectorSession.RegionSelectionMode;
                                     }
                                     break;
                                     #endregion
                             }
+
+                            // Pre-record countdown (#56): shown in the elapsed-time display,
+                            // cancelled by the stop command.
+                            int delaySeconds = AppConfig.Instance.SelectedRecordDelay;
+                            if (delaySeconds > 0)
+                            {
+                                _recordDelayCts = new CancellationTokenSource();
+                                try
+                                {
+                                    for (int remaining = delaySeconds; remaining > 0; remaining--)
+                                    {
+                                        AppManager.Instance.RecordCountdown = remaining;
+                                        await Task.Delay(1000, _recordDelayCts.Token);
+                                    }
+                                }
+                                catch (OperationCanceledException)
+                                {
+                                    return;
+                                }
+                                finally
+                                {
+                                    AppManager.Instance.RecordCountdown = 0;
+                                    _recordDelayCts.Dispose();
+                                    _recordDelayCts = null;
+                                }
+
+                                // The app may have started closing/recording while we waited.
+                                if (AppManager.Instance.ScreenEncoder == null ||
+                                    AppManager.Instance.ScreenEncoder.Status != Encoder.EncoderStatus.Stop)
+                                {
+                                    return;
+                                }
+                            }
+
+                            var qualityMode = AppConfig.Instance.AdvancedSettings
+                                ? AppConfig.Instance.SelectedRecordQualityMode
+                                : RecordQualityMode.Bitrate;
 
                             // Start Record
                             try
@@ -293,7 +336,9 @@ namespace ScreenRecorder
                                     audioCodec, AppConfig.Instance.SelectedRecordAudioBitrate,
                                     displayDeviceName, region,
                                     AppConfig.Instance.ScreenCaptureCursorVisible,
-                                    AppConfig.Instance.RecordMicrophone);
+                                    AppConfig.Instance.RecordMicrophone,
+                                    qualityMode == RecordQualityMode.Bitrate ? MediaEncoder.RateControl.Cbr : MediaEncoder.RateControl.Cq,
+                                    RecordQualityModeItem.ToQualityValue(qualityMode));
                             }
                             catch
                             {
@@ -322,6 +367,12 @@ namespace ScreenRecorder
         public DelegateCommand StopScreenRecordCommand => _stopScreenRecordCommand ??
             (_stopScreenRecordCommand = new DelegateCommand(o =>
             {
+                if (_recordDelayCts != null)
+                {
+                    _recordDelayCts.Cancel(); // abort the pre-record countdown
+                    return;
+                }
+
                 if (AppManager.Instance.ScreenEncoder.Status != EncoderStatus.Stop)
                 {
                     AppManager.Instance.ScreenEncoder.Stop();
@@ -415,6 +466,15 @@ namespace ScreenRecorder
                 if (o is Window window)
                 {
                     window.Close();
+                }
+            }, o => o is Window));
+
+        public DelegateCommand WindowMinimizeCommand => _windowMinimizeCommand ??
+            (_windowMinimizeCommand = new DelegateCommand(o =>
+            {
+                if (o is Window window)
+                {
+                    window.WindowState = WindowState.Minimized;
                 }
             }, o => o is Window));
 
